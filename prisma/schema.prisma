@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  passwordHash  String
+  name          String?
+  // plan: "trial" | "weekly" | "monthly" | "lifetime"
+  plan          String    @default("trial")
+  // For trial/weekly/monthly: when access ends. Null => lifetime (never expires)
+  planExpiresAt DateTime?
+  trialEndsAt   DateTime
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  sessions      Session[]
+  scrapes       Scrape[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Scrape {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url       String
+  title     String?
+  mode      String   @default("auto")
+  itemCount Int      @default(0)
+  // JSON-encoded array of extracted records
+  data      String   @default("[]")
+  createdAt DateTime @default(now())
+}
