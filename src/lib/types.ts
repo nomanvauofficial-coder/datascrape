@@ -1,5 +1,7 @@
 /* Shared client-side types + API helper for ScrapeFlow */
 
+import { getSupabase } from '@/lib/supabase-browser'
+
 export type PlanIdClient = 'trial' | 'weekly' | 'monthly' | 'lifetime'
 
 export interface ClientUser {
@@ -40,6 +42,8 @@ export interface ScrapeResponse {
   responseTimeMs: number
   truncated: boolean
   remainingToday: number | null
+  note?: string | null
+  pagesFetched?: number
 }
 
 export interface HistoryItem {
@@ -90,7 +94,7 @@ export const PLAN_META: PlanMeta[] = [
     features: [
       'Up to 50 items per scrape',
       '100 scrapes per day',
-      'All 6 extract modes',
+      'All 9 extract modes',
       'CSV & JSON export',
       'Full scrape history',
       'Email support',
@@ -108,7 +112,7 @@ export const PLAN_META: PlanMeta[] = [
     features: [
       'Up to 100 items per scrape',
       '500 scrapes per day',
-      'All 6 extract modes',
+      'All 9 extract modes',
       'Priority processing',
       'Advanced product & price detection',
       'CSV & JSON export',
@@ -127,15 +131,13 @@ export const PLAN_META: PlanMeta[] = [
       'Up to 200 items per scrape',
       'Unlimited scrapes — forever',
       'Never expires, no renewals',
-      'All 6 extract modes',
+      'All 9 extract modes',
       'All future extract modes included',
       'CSV & JSON export',
       'Dedicated support channel',
     ],
   },
 ]
-
-export const TOKEN_KEY = 'scrapeflow_token'
 
 export class ApiError extends Error {
   code?: string
@@ -151,8 +153,12 @@ export async function api<T>(
   path: string,
   opts: { method?: string; body?: unknown; auth?: boolean } = {}
 ): Promise<T> {
-  const token =
-    typeof window !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null
+  // Supabase keeps the session fresh (auto-refresh) — always read the current token.
+  let token: string | null = null
+  if (typeof window !== 'undefined' && opts.auth !== false) {
+    const { data } = await getSupabase().auth.getSession()
+    token = data.session?.access_token ?? null
+  }
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (token && opts.auth !== false) headers['Authorization'] = `Bearer ${token}`
 

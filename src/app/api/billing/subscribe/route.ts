@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { adminClient } from '@/lib/supabase-server'
 import { getUserFromRequest, publicUser } from '@/lib/auth'
 import { PLANS, computeAccess } from '@/lib/plans'
 
@@ -66,13 +66,30 @@ export async function POST(req: NextRequest) {
       ? null
       : new Date(Date.now() + plan.durationDays * 24 * 60 * 60 * 1000)
 
-  const updated = await db.user.update({
-    where: { id: user.id },
-    data: {
+  const admin = adminClient()
+  if (!admin) {
+    return NextResponse.json(
+      { error: 'Billing is not configured on the server yet (missing SUPABASE_SERVICE_ROLE_KEY).' },
+      { status: 500 }
+    )
+  }
+  const { data: row, error } = await admin
+    .from('profiles')
+    .update({
       plan: plan.id,
-      planExpiresAt,
-    },
-  })
+      plan_expires_at: planExpiresAt ? planExpiresAt.toISOString() : null,
+    })
+    .eq('id', user.id)
+    .select('*')
+    .single()
+  if (error || !row) {
+    return NextResponse.json({ error: 'Could not activate the plan. Please try again.' }, { status: 500 })
+  }
+  const updated = {
+    ...user,
+    plan: row.plan as string,
+    planExpiresAt: row.plan_expires_at ? new Date(row.plan_expires_at) : null,
+  }
 
   const access = computeAccess(updated)
   return NextResponse.json({

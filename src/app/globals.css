@@ -143,6 +143,17 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-feature-settings: 'cv11', 'ss01';
+    text-rendering: optimizeLegibility;
+    -webkit-text-size-adjust: 100%;
+  }
+  h1, h2, h3, h4 {
+    letter-spacing: -0.02em;
+    font-weight: 700;
+  }
+  h1 { letter-spacing: -0.035em; }
+  code, kbd, pre, .font-mono {
+    font-feature-settings: 'calt', 'zero';
   }
 }
 

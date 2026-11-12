@@ -30,7 +30,7 @@ export const PLANS: PlanDef[] = [
     features: [
       'Up to 50 items per scrape',
       '100 scrapes per day',
-      'All extract modes (auto, products, links, images, tables, text)',
+      'All 9 extract modes (auto, products, links, images, tables, text, embedded data, contacts, custom selector)',
       'CSV & JSON export',
       'Full scrape history',
       'Email support',

@@ -50,6 +50,7 @@ import {
   type ClientUser,
   type ClientAccess,
   type ScrapeResponse,
+  type ScrapeItem,
   type HistoryItem,
   type PlanIdClient,
 } from '@/lib/types'
@@ -69,7 +70,12 @@ const MODES = [
   { value: 'images', label: 'All images', hint: 'Image URLs with alt text' },
   { value: 'tables', label: 'HTML tables', hint: 'Table rows with column headers' },
   { value: 'text', label: 'Text & headings', hint: 'Headings, meta description and paragraphs' },
+  { value: 'structured', label: 'Embedded data (JSON)', hint: 'Reads JSON-LD and hidden app data (Next.js, Nuxt…) — works on many JavaScript-built sites' },
+  { value: 'contacts', label: 'Emails, phones & socials', hint: 'Collects email addresses, phone numbers and social profile links' },
+  { value: 'custom', label: 'Custom selector (any element)', hint: 'Type a CSS selector to grab exactly what you want, e.g. .price or a.title@href' },
 ]
+
+const PAGE_OPTIONS = [1, 2, 3, 5]
 
 function planBadgeClass(plan: string): string {
   switch (plan) {
@@ -90,6 +96,8 @@ export function Dashboard({ user, access, todayCount, onRefreshMe, onLogout }: D
   const [tab, setTab] = useState<'scraper' | 'history' | 'billing'>('scraper')
   const [url, setUrl] = useState('')
   const [mode, setMode] = useState('auto')
+  const [selector, setSelector] = useState('')
+  const [pages, setPages] = useState('1')
   const [scraping, setScraping] = useState(false)
   const [scrapeError, setScrapeError] = useState('')
   const [result, setResult] = useState<ScrapeResponse | null>(null)
@@ -127,7 +135,7 @@ export function Dashboard({ user, access, todayCount, onRefreshMe, onLogout }: D
     try {
       const res = await api<ScrapeResponse>('/api/scrape', {
         method: 'POST',
-        body: { url, mode },
+        body: { url, mode, selector: mode === 'custom' ? selector : undefined, pages: Number(pages) },
       })
       setResult(res)
       toast({
@@ -168,6 +176,7 @@ export function Dashboard({ user, access, todayCount, onRefreshMe, onLogout }: D
       })
       setUrl(res.url)
       setMode(res.mode)
+      setSelector('')
       setTab('scraper')
     } catch (err) {
       toast({
@@ -341,11 +350,35 @@ export function Dashboard({ user, access, todayCount, onRefreshMe, onLogout }: D
                   </Button>
                 </div>
               </div>
+              <div className="flex flex-col sm:flex-row gap-3">
+                {mode === 'custom' && (
+                  <Input
+                    value={selector}
+                    onChange={(e) => setSelector(e.target.value)}
+                    placeholder="CSS selector — e.g. .product-card h2   or   a.title@href"
+                    className="h-11 flex-1 font-mono text-sm"
+                    aria-label="CSS selector"
+                    disabled={!access.hasAccess}
+                  />
+                )}
+                <Select value={pages} onValueChange={setPages} disabled={!access.hasAccess}>
+                  <SelectTrigger className="h-11 w-full sm:w-[200px]" aria-label="Pages to scrape">
+                    <SelectValue placeholder="Pages" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PAGE_OPTIONS.map((n) => (
+                      <SelectItem key={n} value={String(n)}>
+                        {n === 1 ? '1 page' : `Follow “next” — ${n} pages`}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
               <p className="text-xs text-muted-foreground">
                 {MODES.find((m) => m.value === mode)?.hint}
                 {' · '}Your <span className="text-foreground font-medium">{access.plan}</span> plan
                 extracts up to <span className="text-primary font-medium">{access.itemsPerScrape} items</span> per
-                scrape{' · '}server-side, 25s timeout.
+                scrape{' · '}server-side.
               </p>
             </form>
 
@@ -361,7 +394,7 @@ export function Dashboard({ user, access, todayCount, onRefreshMe, onLogout }: D
               <div className="rounded-2xl border border-border bg-card p-8 flex flex-col items-center gap-4">
                 <Loader2 className="w-8 h-8 animate-spin text-primary" />
                 <div className="text-sm text-muted-foreground">
-                  Fetching and parsing the page… this can take up to 25 seconds.
+                  Fetching and parsing the page… multi-page scrapes can take up to 45 seconds.
                 </div>
               </div>
             )}
@@ -376,6 +409,13 @@ export function Dashboard({ user, access, todayCount, onRefreshMe, onLogout }: D
                     {result.pageTitle || result.url}
                   </h2>
                 </div>
+                {result.note && (
+                  <Alert className="border-sky-500/40 bg-sky-500/10">
+                    <AlertTriangle className="w-4 h-4 text-sky-400" />
+                    <AlertTitle className="text-sky-300">Good to know</AlertTitle>
+                    <AlertDescription className="text-sky-200/80">{result.note}</AlertDescription>
+                  </Alert>
+                )}
                 {result.truncatedByPlan && (
                   <Alert className="border-amber-500/40 bg-amber-500/10">
                     <AlertTriangle className="w-4 h-4 text-amber-400" />

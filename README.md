@@ -17,23 +17,18 @@ free trial and Weekly / Monthly / Lifetime subscription tiers (simulated checkou
 
 ## Tech stack
 
-Next.js 16 (App Router) · TypeScript · Prisma + SQLite · cheerio · Tailwind CSS 4 · shadcn/ui
+Next.js 16 (App Router) · TypeScript · Supabase (Auth + Postgres) · cheerio · Tailwind CSS 4 · shadcn/ui
 
 ## Run locally
 
-```bash
-# 1. install dependencies (also generates the Prisma client via postinstall)
-npm install        # or: bun install
-
-# 2. create your env file
-cp .env.example .env
-
-# 3. create the database schema
-npm run db:push
-
-# 4. start the dev server
-npm run dev        # http://localhost:3000
 ```
+npm install
+cp .env.example .env.local   # then fill SUPABASE_SERVICE_ROLE_KEY
+npm run dev                  # http://localhost:3000
+```
+
+Auth and data live in **Supabase** (tables `profiles` and `scrapes`, with Row Level Security).
+Users sign up / log in with Supabase Auth; a database trigger creates their 1-day trial profile.
 
 ## Push this project to GitHub
 

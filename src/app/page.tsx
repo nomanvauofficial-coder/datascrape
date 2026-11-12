@@ -5,9 +5,10 @@ import { Loader2 } from 'lucide-react'
 import { Landing } from '@/components/scrapeflow/landing'
 import { AuthModal } from '@/components/scrapeflow/auth-modal'
 import { Dashboard } from '@/components/scrapeflow/dashboard'
+import { getSupabase } from '@/lib/supabase-browser'
 import {
   api,
-  TOKEN_KEY,
+  ApiError,
   type ClientUser,
   type ClientAccess,
   type MeResponse,
@@ -21,50 +22,54 @@ export default function Home() {
   const [authOpen, setAuthOpen] = useState(false)
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('signup')
 
+  const clearLocal = useCallback(() => {
+    setUser(null)
+    setAccess(null)
+    setTodayCount(0)
+  }, [])
+
   const refreshMe = useCallback(async () => {
     try {
       const res = await api<MeResponse>('/api/auth/me')
       setUser(res.user)
       setAccess(res.access)
       setTodayCount(res.todayCount)
-    } catch {
-      // token invalid/expired — clear it
-      localStorage.removeItem(TOKEN_KEY)
-      setUser(null)
-      setAccess(null)
+    } catch (err) {
+      // Only a 401 means the session is really invalid; other errors (network…) keep you logged in.
+      if (err instanceof ApiError && err.status === 401) {
+        await getSupabase().auth.signOut()
+        clearLocal()
+      }
     }
-  }, [])
+  }, [clearLocal])
 
   useEffect(() => {
+    const supabase = getSupabase()
+    let active = true
     const boot = async () => {
-      const token = localStorage.getItem(TOKEN_KEY)
-      if (token) await refreshMe()
-      setBooting(false)
+      const { data } = await supabase.auth.getSession()
+      if (data.session) await refreshMe()
+      if (active) setBooting(false)
     }
     boot()
+    const { data: sub } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') clearLocal()
+    })
+    return () => {
+      active = false
+      sub.subscription.unsubscribe()
+    }
+  }, [refreshMe, clearLocal])
+
+  const handleAuthed = useCallback(async () => {
+    setAuthOpen(false)
+    await refreshMe()
   }, [refreshMe])
 
-  const handleAuthed = useCallback(
-    async (token: string, authedUser: ClientUser) => {
-      localStorage.setItem(TOKEN_KEY, token)
-      setUser(authedUser)
-      setAuthOpen(false)
-      await refreshMe()
-    },
-    [refreshMe]
-  )
-
   const handleLogout = useCallback(async () => {
-    try {
-      await api('/api/auth/me', { method: 'DELETE' })
-    } catch {
-      /* ignore */
-    }
-    localStorage.removeItem(TOKEN_KEY)
-    setUser(null)
-    setAccess(null)
-    setTodayCount(0)
-  }, [])
+    await getSupabase().auth.signOut()
+    clearLocal()
+  }, [clearLocal])
 
   const openAuth = (mode: 'login' | 'signup') => {
     setAuthMode(mode)

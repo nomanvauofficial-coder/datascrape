@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
 import { getUserFromRequest, publicUser } from '@/lib/auth'
 import { computeAccess } from '@/lib/plans'
 import { scrapeUrl, type ScrapeMode } from '@/lib/scraper'
@@ -7,7 +6,10 @@ import { scrapeUrl, type ScrapeMode } from '@/lib/scraper'
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
-const VALID_MODES: ScrapeMode[] = ['auto', 'products', 'links', 'images', 'tables', 'text']
+const VALID_MODES: ScrapeMode[] = [
+  'auto', 'products', 'links', 'images', 'tables', 'text',
+  'structured', 'contacts', 'custom',
+]
 
 export async function POST(req: NextRequest) {
   const user = await getUserFromRequest(req)
@@ -24,11 +26,12 @@ export async function POST(req: NextRequest) {
   // daily quota check
   if (access.dailyLimit !== null) {
     const startOfDay = new Date()
-    startOfDay.setHours(0, 0, 0, 0)
-    const todayCount = await db.scrape.count({
-      where: { userId: user.id, createdAt: { gte: startOfDay } },
-    })
-    if (todayCount >= access.dailyLimit) {
+    startOfDay.setUTCHours(0, 0, 0, 0)
+    const { count: todayCount } = await user.db
+      .from('scrapes')
+      .select('id', { count: 'exact', head: true })
+      .gte('created_at', startOfDay.toISOString())
+    if ((todayCount ?? 0) >= access.dailyLimit) {
       return NextResponse.json(
         {
           error: `Daily limit reached (${access.dailyLimit} scrapes/day on your plan). The counter resets at midnight.`,
@@ -39,7 +42,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  let body: { url?: string; mode?: string }
+  let body: { url?: string; mode?: string; selector?: string; pages?: number }
   try {
     body = await req.json()
   } catch {
@@ -49,7 +52,11 @@ export async function POST(req: NextRequest) {
   const mode = (VALID_MODES.includes(body.mode as ScrapeMode) ? body.mode : 'auto') as ScrapeMode
 
   try {
-    const result = await scrapeUrl(String(body.url ?? ''), mode)
+    const pages = Math.min(5, Math.max(1, Math.floor(Number(body.pages) || 1)))
+    const result = await scrapeUrl(String(body.url ?? ''), mode, {
+      selector: String(body.selector ?? '').trim().slice(0, 300) || undefined,
+      pages,
+    })
 
     // apply plan-based per-scrape item limit
     const planLimit = access.itemsPerScrape
@@ -57,24 +64,30 @@ export async function POST(req: NextRequest) {
     const items = result.items.slice(0, planLimit)
     const truncatedByPlan = foundCount > planLimit
 
-    const saved = await db.scrape.create({
-      data: {
-        userId: user.id,
+    const { data: saved, error: saveError } = await user.db
+      .from('scrapes')
+      .insert({
+        user_id: user.id,
         url: result.finalUrl,
         title: result.pageTitle || result.finalUrl,
         mode: result.mode,
-        itemCount: items.length,
-        data: JSON.stringify(items),
-      },
-    })
+        item_count: items.length,
+        data: items,
+      })
+      .select('id')
+      .single()
+    if (saveError || !saved) {
+      throw new Error('Scrape worked but saving it to your history failed. Please try again.')
+    }
 
     const startOfDay = new Date()
-    startOfDay.setHours(0, 0, 0, 0)
-    const todayTotal = await db.scrape.count({
-      where: { userId: user.id, createdAt: { gte: startOfDay } },
-    })
+    startOfDay.setUTCHours(0, 0, 0, 0)
+    const { count: todayTotal } = await user.db
+      .from('scrapes')
+      .select('id', { count: 'exact', head: true })
+      .gte('created_at', startOfDay.toISOString())
     const remaining =
-      access.dailyLimit === null ? null : Math.max(0, access.dailyLimit - todayTotal)
+      access.dailyLimit === null ? null : Math.max(0, access.dailyLimit - (todayTotal ?? 0))
 
     return NextResponse.json({
       id: saved.id,
@@ -90,6 +103,8 @@ export async function POST(req: NextRequest) {
       responseTimeMs: result.responseTimeMs,
       truncated: result.truncated,
       remainingToday: remaining,
+      note: result.note ?? null,
+      pagesFetched: result.pagesFetched,
       user: publicUser(user),
     })
   } catch (err) {

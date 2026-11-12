@@ -13,12 +13,12 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Loader2, Globe, Clock, ShieldCheck } from 'lucide-react'
-import { api, type ClientUser } from '@/lib/types'
+import { getSupabase } from '@/lib/supabase-browser'
 
 interface AuthModalProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onAuthed: (token: string, user: ClientUser) => void
+  onAuthed: () => void | Promise<void>
   initialMode: 'login' | 'signup'
 }
 
@@ -29,36 +29,60 @@ export function AuthModal({ open, onOpenChange, onAuthed, initialMode }: AuthMod
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [info, setInfo] = useState('')
 
   const handleModeChange = (m: string) => {
     setMode(m as 'login' | 'signup')
     setError('')
+    setInfo('')
   }
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
+    setInfo('')
     setLoading(true)
     try {
+      const supabase = getSupabase()
+      const cleanEmail = email.trim().toLowerCase()
       if (mode === 'signup') {
-        const res = await api<{ token: string; user: ClientUser }>('/api/auth/signup', {
-          method: 'POST',
-          body: { name, email, password },
+        const { data, error: err } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password,
+          options: { data: { name: name.trim() } },
         })
-        onAuthed(res.token, res.user)
+        if (err) throw err
+        // Supabase hides "already registered" by returning a user with no identities.
+        if (data.user && data.user.identities && data.user.identities.length === 0) {
+          throw new Error('An account with this email already exists. Try logging in.')
+        }
+        if (!data.session) {
+          // Email confirmation is switched on in Supabase → ask the user to confirm first.
+          setInfo('Account created! Check your email and click the confirmation link, then log in.')
+          setPassword('')
+          setMode('login')
+          return
+        }
       } else {
-        const res = await api<{ token: string; user: ClientUser }>('/api/auth/signup', {
-          method: 'PUT',
-          body: { email, password },
+        const { error: err } = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password,
         })
-        onAuthed(res.token, res.user)
+        if (err) throw err
       }
-      // reset form
+      await onAuthed()
       setName('')
       setEmail('')
       setPassword('')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong.')
+      const msg = err instanceof Error ? err.message : 'Something went wrong.'
+      setError(
+        /invalid login credentials/i.test(msg)
+          ? 'Invalid email or password.'
+          : /email not confirmed/i.test(msg)
+            ? 'Please confirm your email first — check your inbox for the link.'
+            : msg
+      )
     } finally {
       setLoading(false)
     }
@@ -126,6 +150,11 @@ export function AuthModal({ open, onOpenChange, onAuthed, initialMode }: AuthMod
                   autoComplete="new-password"
                 />
               </div>
+              {info && (
+                <p className="text-sm text-primary bg-primary/10 border border-primary/30 rounded-lg px-3 py-2">
+                  {info}
+                </p>
+              )}
               {error && (
                 <p className="text-sm text-destructive bg-destructive/10 border border-destructive/30 rounded-lg px-3 py-2">
                   {error}
@@ -177,6 +206,11 @@ export function AuthModal({ open, onOpenChange, onAuthed, initialMode }: AuthMod
                   autoComplete="current-password"
                 />
               </div>
+              {info && (
+                <p className="text-sm text-primary bg-primary/10 border border-primary/30 rounded-lg px-3 py-2">
+                  {info}
+                </p>
+              )}
               {error && (
                 <p className="text-sm text-destructive bg-destructive/10 border border-destructive/30 rounded-lg px-3 py-2">
                   {error}

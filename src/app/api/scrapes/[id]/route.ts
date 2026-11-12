@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
 import { getUserFromRequest } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -13,7 +12,11 @@ export async function GET(
   if (!user) return NextResponse.json({ error: 'Not authenticated.' }, { status: 401 })
 
   const { id } = await ctx.params
-  const scrape = await db.scrape.findFirst({ where: { id, userId: user.id } })
+  const { data: scrape } = await user.db
+    .from('scrapes')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle()
   if (!scrape) return NextResponse.json({ error: 'Scrape not found.' }, { status: 404 })
 
   return NextResponse.json({
@@ -21,9 +24,9 @@ export async function GET(
     url: scrape.url,
     pageTitle: scrape.title,
     mode: scrape.mode,
-    items: JSON.parse(scrape.data),
-    itemCount: scrape.itemCount,
-    createdAt: scrape.createdAt,
+    items: scrape.data,
+    itemCount: scrape.item_count,
+    createdAt: scrape.created_at,
   })
 }
 
@@ -36,8 +39,8 @@ export async function DELETE(
   if (!user) return NextResponse.json({ error: 'Not authenticated.' }, { status: 401 })
 
   const { id } = await ctx.params
-  const deleted = await db.scrape.deleteMany({ where: { id, userId: user.id } })
-  if (deleted.count === 0) {
+  const { data } = await user.db.from('scrapes').delete().eq('id', id).select('id')
+  if (!data || data.length === 0) {
     return NextResponse.json({ error: 'Scrape not found.' }, { status: 404 })
   }
   return NextResponse.json({ ok: true })

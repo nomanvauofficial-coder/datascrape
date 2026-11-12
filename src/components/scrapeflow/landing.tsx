@@ -284,7 +284,7 @@ export function Landing({ onGetStarted, onSignIn }: LandingProps) {
                     'Full 24-hour access',
                     'Up to 20 items per scrape',
                     '10 scrapes per day',
-                    'All 6 extract modes',
+                    'All 9 extract modes',
                     'CSV & JSON export',
                     'No credit card required',
                   ].map((feat) => (

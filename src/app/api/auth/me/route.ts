@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
 import { getUserFromRequest, publicUser } from '@/lib/auth'
 import { computeAccess } from '@/lib/plans'
 
@@ -11,22 +10,12 @@ export async function GET(req: NextRequest) {
 
   const access = computeAccess(user)
 
-  // count scrapes made today
   const startOfDay = new Date()
-  startOfDay.setHours(0, 0, 0, 0)
-  const todayCount = await db.scrape.count({
-    where: { userId: user.id, createdAt: { gte: startOfDay } },
-  })
+  startOfDay.setUTCHours(0, 0, 0, 0)
+  const { count } = await user.db
+    .from('scrapes')
+    .select('id', { count: 'exact', head: true })
+    .gte('created_at', startOfDay.toISOString())
 
-  return NextResponse.json({ user: publicUser(user), access, todayCount })
-}
-
-/** DELETE => log out (removes the session token) */
-export async function DELETE(req: NextRequest) {
-  const { getTokenFromRequest } = await import('@/lib/auth')
-  const token = getTokenFromRequest(req)
-  if (token) {
-    await db.session.deleteMany({ where: { token } })
-  }
-  return NextResponse.json({ ok: true })
+  return NextResponse.json({ user: publicUser(user), access, todayCount: count ?? 0 })
 }

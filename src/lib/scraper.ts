@@ -2,7 +2,23 @@ import * as cheerio from 'cheerio'
 import { lookup } from 'dns/promises'
 import type { AnyNode } from 'domhandler'
 
-export type ScrapeMode = 'auto' | 'products' | 'links' | 'images' | 'tables' | 'text'
+export type ScrapeMode =
+  | 'auto'
+  | 'products'
+  | 'links'
+  | 'images'
+  | 'tables'
+  | 'text'
+  | 'structured'
+  | 'contacts'
+  | 'custom'
+
+export interface ScrapeOptions {
+  /** CSS selector for mode "custom". Optional "@attr" suffix, e.g. "a.item@href" */
+  selector?: string
+  /** How many pages to follow via "next" links (1–5) */
+  pages?: number
+}
 
 export interface ScrapeResult {
   finalUrl: string
@@ -12,6 +28,8 @@ export interface ScrapeResult {
   items: Record<string, string>[]
   responseTimeMs: number
   truncated: boolean
+  pagesFetched: number
+  note?: string
 }
 
 const MAX_ITEMS = 500
@@ -72,29 +90,78 @@ async function assertPublicHost(hostname: string): Promise<void> {
 
 /* ------------------------------ fetching ------------------------------ */
 
-async function fetchPage(url: string): Promise<{ html: string; finalUrl: string }> {
-  await assertPublicHost(new URL(url).hostname)
+export interface Fetched {
+  body: string
+  finalUrl: string
+  contentType: string
+}
+
+class HttpError extends Error {
+  status: number
+  constructor(status: number, statusText: string) {
+    super(
+      `The site responded with HTTP ${status} ${statusText}. Some sites block bots — try another URL.`
+    )
+    this.status = status
+  }
+}
+
+const HEADER_SETS: Record<string, string>[] = [
+  {
+    'User-Agent': UA,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7',
+    'Accept-Language': 'en-US,en;q=0.9',
+  },
+  {
+    'User-Agent':
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    Accept: '*/*',
+    'Accept-Language': 'en;q=0.8',
+  },
+]
+
+function decodeBody(bytes: ArrayBuffer, contentType: string): string {
+  let label = /charset=["']?([\w-]+)/i.exec(contentType)?.[1]
+  if (!label) {
+    const head = new TextDecoder('latin1').decode(bytes.slice(0, 2048))
+    label = /<meta[^>]+charset=["']?([\w-]+)/i.exec(head)?.[1]
+  }
+  try {
+    return new TextDecoder(label || 'utf-8').decode(bytes)
+  } catch {
+    return new TextDecoder('utf-8').decode(bytes)
+  }
+}
+
+async function fetchOnce(url: string, attempt: number): Promise<Fetched> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
   try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: {
-        'User-Agent': UA,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-    })
-    if (!res.ok) {
-      throw new Error(
-        `The site responded with HTTP ${res.status} ${res.statusText}. Some sites block bots — try another URL.`
-      )
+    let current = url
+    // Follow redirects manually so EVERY hop is checked against the private-network guard.
+    for (let hop = 0; hop <= 5; hop++) {
+      await assertPublicHost(new URL(current).hostname)
+      const res = await fetch(current, {
+        signal: controller.signal,
+        redirect: 'manual',
+        headers: HEADER_SETS[attempt] ?? HEADER_SETS[0],
+      })
+      const location = res.headers.get('location')
+      if (res.status >= 300 && res.status < 400 && location) {
+        const next = new URL(location, current)
+        if (!['http:', 'https:'].includes(next.protocol)) {
+          throw new Error('The site redirected to an unsupported address.')
+        }
+        current = next.href
+        continue
+      }
+      if (!res.ok) throw new HttpError(res.status, res.statusText)
+      const contentType = res.headers.get('content-type') ?? ''
+      const buf = await res.arrayBuffer()
+      const bytes = buf.byteLength > MAX_BYTES ? buf.slice(0, MAX_BYTES) : buf
+      return { body: decodeBody(bytes, contentType), finalUrl: current, contentType }
     }
-    const buf = await res.arrayBuffer()
-    const bytes = buf.byteLength > MAX_BYTES ? buf.slice(0, MAX_BYTES) : buf
-    const html = new TextDecoder('utf-8').decode(bytes)
-    return { html, finalUrl: res.url || url }
+    throw new Error('The site redirected too many times.')
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
       throw new Error('The site took too long to respond (25s timeout).')
@@ -102,6 +169,18 @@ async function fetchPage(url: string): Promise<{ html: string; finalUrl: string 
     throw err
   } finally {
     clearTimeout(timer)
+  }
+}
+
+async function fetchPage(url: string): Promise<Fetched> {
+  try {
+    return await fetchOnce(url, 0)
+  } catch (err) {
+    // Blocked? Retry once with a different browser fingerprint.
+    if (err instanceof HttpError && [403, 429, 503].includes(err.status)) {
+      return await fetchOnce(url, 1)
+    }
+    throw err
   }
 }
 
@@ -364,7 +443,9 @@ function bestSiblingCandidate(
     const children: AnyNode[] = []
     $(parent)
       .children()
-      .each((_, c) => children.push(c))
+      .each((_, c) => {
+        children.push(c)
+      })
     if (children.length < 3) return
 
     const groups = new Map<string, AnyNode[]>()
@@ -522,53 +603,608 @@ function extractText($: cheerio.CheerioAPI): Record<string, string>[] {
   return out
 }
 
-/* ------------------------------ main entry ------------------------------ */
+/* ------------------------- JSON / structured data ------------------------- */
 
-export async function scrapeUrl(
-  rawUrl: string,
-  mode: ScrapeMode
-): Promise<ScrapeResult> {
-  const url = normalizeInputUrl(rawUrl)
-  const started = Date.now()
-  const { html, finalUrl } = await fetchPage(url)
-  const $ = cheerio.load(html)
+type Json = unknown
 
-  const pageTitle = cleanText($('title').first().text())
-  const pageDescription = cleanText(
+function isPlainObject(v: Json): v is Record<string, Json> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/** Flattens nested JSON into one flat record of strings (dotted keys). */
+function flatten(
+  value: Json,
+  prefix = '',
+  out: Record<string, string> = {},
+  depth = 0
+): Record<string, string> {
+  if (Object.keys(out).length >= 40) return out
+  if (value === null || value === undefined) return out
+  if (typeof value !== 'object') {
+    const key = prefix || 'value'
+    const str = cleanText(String(value))
+    if (str) out[key] = str.slice(0, 500)
+    return out
+  }
+  if (Array.isArray(value)) {
+    if (value.every((v) => v === null || typeof v !== 'object')) {
+      const joined = value.map((v) => cleanText(String(v ?? ''))).filter(Boolean).join(' | ')
+      if (joined) out[prefix || 'value'] = joined.slice(0, 500)
+    } else if (depth < 4) {
+      value.slice(0, 3).forEach((v, i) => flatten(v, `${prefix}.${i}`.replace(/^\./, ''), out, depth + 1))
+    }
+    return out
+  }
+  if (depth >= 4) return out
+  for (const [k, v] of Object.entries(value as Record<string, Json>)) {
+    if (k === '@context') continue
+    const key = (k === '@type' ? 'type' : k === '@id' ? 'id' : k).replace(/^@/, '')
+    flatten(v, prefix ? `${prefix}.${key}` : key, out, depth + 1)
+  }
+  return out
+}
+
+/** Finds the biggest "list of similar objects" anywhere inside a JSON document. */
+function findRecordArray(root: Json): Record<string, Json>[] | null {
+  let best: Record<string, Json>[] | null = null
+  let bestScore = 0
+  let visited = 0
+  const walk = (node: Json, depth: number) => {
+    if (depth > 10 || visited++ > 30_000) return
+    if (Array.isArray(node)) {
+      const objs = node.filter(isPlainObject)
+      if (node.length >= 2 && objs.length >= node.length * 0.7) {
+        const keys = Object.keys(objs[0]).length
+        const score = objs.length * Math.min(keys, 15)
+        if (keys >= 2 && score > bestScore) {
+          bestScore = score
+          best = objs
+        }
+      }
+      for (const v of node.slice(0, 200)) walk(v, depth + 1)
+    } else if (isPlainObject(node)) {
+      for (const v of Object.values(node)) walk(v, depth + 1)
+    }
+  }
+  walk(root, 0)
+  return best
+}
+
+function recordsFromJson(root: Json): Record<string, string>[] {
+  const arr = findRecordArray(root)
+  if (arr) return arr.slice(0, MAX_ITEMS).map((o) => flatten(o)).filter((r) => Object.keys(r).length > 0)
+  if (isPlainObject(root)) {
+    const flat = flatten(root)
+    return Object.keys(flat).length ? [flat] : []
+  }
+  return []
+}
+
+const NOISE_LD_TYPES = new Set([
+  'WebSite', 'WebPage', 'BreadcrumbList', 'Organization', 'SearchAction', 'ImageObject',
+  'ListItem', 'SiteNavigationElement', 'WPHeader', 'WPFooter', 'CollectionPage',
+])
+
+function parseJsonLd($: cheerio.CheerioAPI): Record<string, string>[] {
+  const nodes: Record<string, Json>[] = []
+  $('script[type="application/ld+json"]').each((_, el) => {
+    const raw = ($(el).contents().text() || '').replace(/^\s*<!--/, '').replace(/-->\s*$/, '').trim()
+    if (!raw) return
+    try {
+      const parsed = JSON.parse(raw) as Json
+      const stack: Json[] = Array.isArray(parsed) ? [...parsed] : [parsed]
+      while (stack.length) {
+        const n = stack.shift()
+        if (!isPlainObject(n)) continue
+        if (Array.isArray(n['@graph'])) stack.push(...(n['@graph'] as Json[]))
+        const list = n['itemListElement']
+        if (Array.isArray(list)) {
+          for (const li of list) {
+            if (isPlainObject(li)) nodes.push(isPlainObject(li['item']) ? li['item'] : li)
+          }
+        }
+        if (!n['@graph']) nodes.push(n)
+      }
+    } catch {
+      /* malformed JSON-LD — skip */
+    }
+  })
+  const typeOf = (n: Record<string, Json>) => String(Array.isArray(n['@type']) ? n['@type'][0] : n['@type'] ?? '')
+  const useful = nodes.filter((n) => !NOISE_LD_TYPES.has(typeOf(n)))
+  return (useful.length ? useful : nodes)
+    .slice(0, MAX_ITEMS)
+    .map((n) => flatten(n))
+    .filter((r) => Object.keys(r).length > 1)
+}
+
+const STATE_VARS =
+  /(__INITIAL_STATE__|__NUXT__|__APOLLO_STATE__|__PRELOADED_STATE__|__DATA__|__REDUX_STATE__|initialState|pageData)/
+
+function parseEmbeddedJson($: cheerio.CheerioAPI): Record<string, string>[] {
+  const docs: Json[] = []
+  $('script#__NEXT_DATA__, script[type="application/json"]').each((_, el) => {
+    const raw = $(el).contents().text().trim()
+    if (raw.length < 20 || raw.length > 6_000_000) return
+    try {
+      docs.push(JSON.parse(raw))
+    } catch {
+      /* ignore */
+    }
+  })
+  $('script:not([src]):not([type])').each((_, el) => {
+    const raw = $(el).contents().text()
+    if (raw.length < 200 || raw.length > 6_000_000 || !STATE_VARS.test(raw)) return
+    const start = raw.indexOf('{')
+    const end = raw.lastIndexOf('}')
+    if (start < 0 || end <= start) return
+    try {
+      docs.push(JSON.parse(raw.slice(start, end + 1)))
+    } catch {
+      /* not pure JSON — skip */
+    }
+  })
+  let best: Record<string, string>[] = []
+  let bestScore = 0
+  for (const d of docs) {
+    const arr = findRecordArray(d)
+    if (!arr) continue
+    const recs = arr.slice(0, MAX_ITEMS).map((o) => flatten(o)).filter((r) => Object.keys(r).length > 1)
+    const score = recs.length * Math.min(Object.keys(recs[0] ?? {}).length, 15)
+    if (score > bestScore) {
+      bestScore = score
+      best = recs
+    }
+  }
+  return best
+}
+
+function pageMetaRecord($: cheerio.CheerioAPI, base: string): Record<string, string> {
+  const rec: Record<string, string> = {}
+  const title = cleanText($('title').first().text())
+  if (title) rec.title = title
+  const h1 = cleanText($('h1').first().text())
+  if (h1) rec.h1 = h1
+  $('meta').each((_, el) => {
+    const key = $(el).attr('property') || $(el).attr('name')
+    const val = cleanText($(el).attr('content'))
+    if (key && val && /^(og:|twitter:|description$|keywords$|author$|article:|product:)/i.test(key)) {
+      rec[key] = val.slice(0, 400)
+    }
+  })
+  const canonical = absUrl(base, $('link[rel="canonical"]').attr('href'))
+  if (canonical) rec.canonical = canonical
+  return rec
+}
+
+/** JSON-LD → embedded app state (Next.js, Nuxt…) → page meta. Returns which source was used. */
+function extractStructured(
+  $: cheerio.CheerioAPI,
+  base: string
+): { items: Record<string, string>[]; source: string } {
+  const ld = parseJsonLd($)
+  const emb = parseEmbeddedJson($)
+  if (emb.length >= 3 && emb.length > ld.length) return { items: emb, source: 'embedded page data (JSON)' }
+  if (ld.length) return { items: ld, source: 'JSON-LD structured data' }
+  if (emb.length) return { items: emb, source: 'embedded page data (JSON)' }
+  const meta = pageMetaRecord($, base)
+  return { items: Object.keys(meta).length ? [meta] : [], source: 'page metadata' }
+}
+
+/* ------------------------------ contacts ------------------------------ */
+
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
+const PHONE_RE = /(?:\+|00)?\d[\d\s().-]{7,18}\d/g
+const SOCIAL_HOSTS: [RegExp, string][] = [
+  [/(^|\.)facebook\.com$|(^|\.)fb\.com$/, 'facebook'],
+  [/(^|\.)instagram\.com$/, 'instagram'],
+  [/(^|\.)(twitter|x)\.com$/, 'x/twitter'],
+  [/(^|\.)linkedin\.com$/, 'linkedin'],
+  [/(^|\.)youtube\.com$|(^|\.)youtu\.be$/, 'youtube'],
+  [/(^|\.)tiktok\.com$/, 'tiktok'],
+  [/(^|\.)github\.com$/, 'github'],
+  [/(^|\.)(wa\.me|whatsapp\.com)$/, 'whatsapp'],
+  [/(^|\.)t\.me$|(^|\.)telegram\.me$/, 'telegram'],
+  [/(^|\.)pinterest\.com$/, 'pinterest'],
+]
+
+function extractContacts($: cheerio.CheerioAPI, base: string): Record<string, string>[] {
+  const out: Record<string, string>[] = []
+  const seen = new Set<string>()
+  const add = (type: string, value: string, source: string) => {
+    const v = value.trim()
+    const key = `${type}|${v.toLowerCase()}`
+    if (!v || seen.has(key) || out.length >= MAX_ITEMS) return
+    seen.add(key)
+    out.push({ type, value: v, source })
+  }
+
+  $('a[href^="mailto:"]').each((_, el) => {
+    const m = ($(el).attr('href') || '').replace(/^mailto:/i, '').split('?')[0]
+    if (m) add('email', decodeURIComponent(m), 'mailto link')
+  })
+  $('a[href^="tel:"]').each((_, el) => {
+    const t = ($(el).attr('href') || '').replace(/^tel:/i, '')
+    if (t) add('phone', decodeURIComponent(t), 'tel link')
+  })
+
+  const text = $('body').text()
+  for (const m of text.match(EMAIL_RE) ?? []) {
+    if (!/\.(png|jpe?g|gif|webp|svg)$/i.test(m)) add('email', m, 'page text')
+  }
+  for (const m of text.match(PHONE_RE) ?? []) {
+    const digits = m.replace(/\D/g, '')
+    if (digits.length >= 8 && digits.length <= 15 && !/^(19|20)\d{2}[\s.-]?\d{2}/.test(m.trim())) {
+      add('phone', cleanText(m), 'page text')
+    }
+  }
+
+  $('a[href]').each((_, el) => {
+    const href = absUrl(base, $(el).attr('href'))
+    if (!href) return
+    try {
+      const host = new URL(href).hostname
+      for (const [re, name] of SOCIAL_HOSTS) {
+        if (re.test(host)) {
+          add(name, href, 'link')
+          break
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  })
+
+  // address from schema.org / JSON-LD
+  parseJsonLd($).forEach((r) => {
+    for (const [k, v] of Object.entries(r)) {
+      if (/(^|\.)(telephone|email|streetAddress|addressLocality|postalCode)$/i.test(k)) {
+        add(k.split('.').pop()!.toLowerCase(), v, 'structured data')
+      }
+    }
+  })
+  return out
+}
+
+/* ------------------------------ custom selector ------------------------------ */
+
+function extractCustom(
+  $: cheerio.CheerioAPI,
+  rawSelector: string,
+  base: string
+): Record<string, string>[] {
+  let selector = rawSelector.trim()
+  let attr: string | null = null
+  const at = selector.lastIndexOf('@')
+  if (at > 0 && /^[a-zA-Z_:][\w:.-]*$/.test(selector.slice(at + 1))) {
+    attr = selector.slice(at + 1)
+    selector = selector.slice(0, at).trim()
+  }
+  let nodes: cheerio.Cheerio<AnyNode>
+  try {
+    nodes = $(selector)
+  } catch {
+    throw new Error(`"${rawSelector}" is not a valid CSS selector.`)
+  }
+  if (nodes.length === 0) {
+    throw new Error(
+      `No elements on the page match "${rawSelector}". If the page builds its content with JavaScript, try the "Embedded data" mode instead.`
+    )
+  }
+  const out: Record<string, string>[] = []
+  nodes.each((i, el) => {
+    if (out.length >= MAX_ITEMS) return
+    const $el = $(el)
+    const rec: Record<string, string> = {}
+    if (attr) {
+      const raw = $el.attr(attr) ?? ''
+      rec.value = /^(href|src|action|poster|data-src)$/i.test(attr) ? absUrl(base, raw) || raw : raw
+    }
+    const text = cleanText($el.text())
+    if (text) rec.text = text.slice(0, 600)
+    const href = $el.is('a[href]') ? $el.attr('href') : $el.find('a[href]').first().attr('href')
+    if (href) rec.link = absUrl(base, href)
+    const imgEl = $el.is('img') ? $el : $el.find('img').first()
+    const src = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy-src')
+    if (src) rec.image = absUrl(base, src)
+    const el0 = el as unknown as { attribs?: Record<string, string> }
+    for (const [k, v] of Object.entries(el0.attribs ?? {})) {
+      if (/^(id|alt|title|content|name|value|datetime|itemprop|data-[\w-]+)$/i.test(k) && v) {
+        rec[k] = v.slice(0, 300)
+      }
+    }
+    rec.position = String(i + 1)
+    if (Object.keys(rec).length > 1) out.push(rec)
+  })
+  return out
+}
+
+/* ------------------------- non-HTML responses ------------------------- */
+
+function parseCsv(text: string): Record<string, string>[] {
+  const rows: string[][] = []
+  let cur: string[] = []
+  let field = ''
+  let quoted = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') {
+        field += '"'
+        i++
+      } else if (ch === '"') quoted = false
+      else field += ch
+    } else if (ch === '"') quoted = true
+    else if (ch === ',') {
+      cur.push(field)
+      field = ''
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++
+      cur.push(field)
+      field = ''
+      if (cur.some((c) => c !== '')) rows.push(cur)
+      cur = []
+      if (rows.length > MAX_ITEMS + 1) break
+    } else field += ch
+  }
+  if (field || cur.length) {
+    cur.push(field)
+    rows.push(cur)
+  }
+  const [header, ...rest] = rows
+  if (!header) return []
+  return rest.slice(0, MAX_ITEMS).map((r) => {
+    const rec: Record<string, string> = {}
+    header.forEach((h, i) => {
+      rec[cleanText(h) || `column_${i + 1}`] = cleanText(r[i])
+    })
+    return rec
+  })
+}
+
+/** Handles JSON APIs, XML (sitemaps / RSS / Atom), CSV and plain text. Returns null for HTML. */
+function parseNonHtml(
+  body: string,
+  contentType: string,
+  base: string
+): { items: Record<string, string>[]; title: string } | null {
+  const ct = contentType.toLowerCase()
+  const head = body.trimStart().slice(0, 300).toLowerCase()
+  const looksHtml = ct.includes('html') || head.startsWith('<!doctype html') || head.startsWith('<html')
+  if (looksHtml) return null
+
+  if (ct.includes('json') || head.startsWith('{') || head.startsWith('[')) {
+    try {
+      return { items: recordsFromJson(JSON.parse(body)), title: 'JSON data' }
+    } catch {
+      /* fall through */
+    }
+  }
+  if (ct.includes('xml') || head.startsWith('<?xml') || head.startsWith('<urlset') || head.startsWith('<rss') || head.startsWith('<feed')) {
+    const $x = cheerio.load(body, { xmlMode: true })
+    const items: Record<string, string>[] = []
+    $x('url, sitemap').each((_, el) => {
+      if (items.length >= MAX_ITEMS) return
+      const loc = cleanText($x(el).children('loc').text())
+      if (loc) items.push({ url: loc, last_modified: cleanText($x(el).children('lastmod').text()) })
+    })
+    if (items.length === 0) {
+      $x('item, entry').each((_, el) => {
+        if (items.length >= MAX_ITEMS) return
+        const $el = $x(el)
+        const link = cleanText($el.children('link').first().text()) || $el.children('link').first().attr('href') || ''
+        items.push({
+          title: cleanText($el.children('title').first().text()),
+          link: absUrl(base, link),
+          date: cleanText($el.children('pubDate, updated, published').first().text()),
+          description: cleanText($el.children('description, summary, content').first().text()).slice(0, 300),
+        })
+      })
+    }
+    return { items, title: cleanText($x('title').first().text()) || 'XML feed' }
+  }
+  if (ct.includes('csv')) return { items: parseCsv(body), title: 'CSV data' }
+  if (ct.startsWith('text/')) {
+    const lines = body.split(/\r?\n/).map(cleanText).filter(Boolean).slice(0, MAX_ITEMS)
+    return { items: lines.map((text, i) => ({ line: String(i + 1), text })), title: 'Text file' }
+  }
+  return null
+}
+
+/* ------------------------------ pagination ------------------------------ */
+
+function findNextUrl($: cheerio.CheerioAPI, current: string): string | null {
+  const candidates: (string | undefined)[] = [
+    $('link[rel="next"]').attr('href'),
+    $('a[rel="next"]').attr('href'),
+  ]
+  $('a[href]').each((_, el) => {
+    const $el = $(el)
+    const text = cleanText($el.text())
+    const aria = ($el.attr('aria-label') || $el.attr('title') || '').toLowerCase()
+    const cls = ($el.attr('class') || '').toLowerCase() + ' ' + ($el.parent().attr('class') || '').toLowerCase()
+    if (
+      /^(next|next page|next »|next ›|›|»|→|older|more)$/i.test(text) ||
+      /\bnext\b/.test(aria) ||
+      (/\bnext\b/.test(cls) && !/prev/.test(cls) && text.length < 20)
+    ) {
+      candidates.push($el.attr('href'))
+    }
+  })
+  for (const c of candidates) {
+    const u = absUrl(current, c)
+    if (!u || u === current || u.split('#')[0] === current.split('#')[0]) continue
+    try {
+      if (new URL(u).hostname !== new URL(current).hostname) continue
+    } catch {
+      continue
+    }
+    return u
+  }
+  return null
+}
+
+/* ------------------------------ one page ------------------------------ */
+
+function looksJsRendered($: cheerio.CheerioAPI): boolean {
+  const textLen = cleanText($('body').clone().find('script,style,noscript').remove().end().text()).length
+  const hasRoot = $('#root, #app, #__next, #__nuxt, app-root').length > 0
+  return textLen < 300 && ($('script').length > 2 || hasRoot)
+}
+
+interface PageResult {
+  items: Record<string, string>[]
+  title: string
+  description: string
+  note?: string
+  $?: cheerio.CheerioAPI
+}
+
+export function extractFromPage(
+  fetched: Fetched,
+  mode: ScrapeMode,
+  opts: ScrapeOptions
+): PageResult {
+  const base = fetched.finalUrl
+  const raw = parseNonHtml(fetched.body, fetched.contentType, base)
+  if (raw) {
+    return {
+      items: raw.items,
+      title: raw.title,
+      description: '',
+      note: raw.items.length === 0 ? 'The response was readable but contained no list-like data.' : undefined,
+    }
+  }
+
+  const $ = cheerio.load(fetched.body)
+  const title = cleanText($('title').first().text())
+  const description = cleanText(
     $('meta[name="description"]').attr('content') ||
       $('meta[property="og:description"]').attr('content') ||
       ''
   )
-
   let items: Record<string, string>[] = []
-  let truncated = false
+  let note: string | undefined
 
-  if (mode === 'links') {
-    items = extractLinks($, finalUrl)
-  } else if (mode === 'images') {
-    items = extractImages($, finalUrl)
-  } else if (mode === 'tables') {
-    items = extractTables($)
-  } else if (mode === 'text') {
-    items = extractText($)
+  if (mode === 'links') items = extractLinks($, base)
+  else if (mode === 'images') items = extractImages($, base)
+  else if (mode === 'tables') items = extractTables($)
+  else if (mode === 'text') items = extractText($)
+  else if (mode === 'contacts') items = extractContacts($, base)
+  else if (mode === 'custom') {
+    if (!opts.selector) throw new Error('Enter a CSS selector for Custom selector mode (e.g. ".product-card h2").')
+    items = extractCustom($, opts.selector, base)
+  } else if (mode === 'structured') {
+    const s = extractStructured($, base)
+    items = s.items
+    note = items.length ? `Read from ${s.source}.` : undefined
   } else {
     // auto & products
-    const group = detectRepeatingGroup($, finalUrl)
-    if (group) {
-      items = group.items
-    }
+    const group = detectRepeatingGroup($, base)
+    if (group) items = group.items
     if (mode === 'products') {
       const priced = items.filter((i) => i.price)
       if (priced.length >= 3) items = priced
     }
-    // fallback: nothing detected → give links so the user still gets value
     if (items.length < 3) {
-      items = extractLinks($, finalUrl).slice(0, 100)
+      const s = extractStructured($, base)
+      if (s.items.length >= 3 || (s.items.length > 0 && s.source !== 'page metadata' && items.length === 0)) {
+        items = s.items
+        note = `No repeating blocks found, so the data was read from ${s.source}.`
+      }
+    }
+    if (items.length < 3) {
+      items = extractLinks($, base).slice(0, 100)
+      note = looksJsRendered($)
+        ? 'This page builds its content with JavaScript after loading, which this scraper cannot run. Showing the links that are available. Try the "Embedded data" or "Custom selector" mode, or a different URL (e.g. the site’s sitemap or API).'
+        : 'No repeating product/list blocks were detected, so all links are shown. Try "Custom selector" to pick exactly what you want.'
     }
   }
 
-  if (items.length > MAX_ITEMS) {
-    items = items.slice(0, MAX_ITEMS)
+  if (items.length === 0 && !note) {
+    note = looksJsRendered($)
+      ? 'Nothing found — this page builds its content with JavaScript, which this scraper cannot run.'
+      : 'Nothing matching this mode was found on the page.'
+  }
+  return { items, title, description, note, $ }
+}
+
+/* ------------------------------ main entry ------------------------------ */
+
+export async function scrapeUrl(
+  rawUrl: string,
+  mode: ScrapeMode,
+  opts: ScrapeOptions = {}
+): Promise<ScrapeResult> {
+  const url = normalizeInputUrl(rawUrl)
+  const started = Date.now()
+  const maxPages = Math.min(5, Math.max(1, opts.pages ?? 1))
+
+  let currentUrl = url
+  let finalUrl = url
+  let pageTitle = ''
+  let pageDescription = ''
+  let note: string | undefined
+  let pagesFetched = 0
+  const items: Record<string, string>[] = []
+  const seenKeys = new Set<string>()
+  const visited = new Set<string>()
+
+  for (let page = 1; page <= maxPages; page++) {
+    if (page > 1 && Date.now() - started > 40_000) {
+      note = [note, 'Stopped following pages early to stay within the time limit.'].filter(Boolean).join(' ')
+      break
+    }
+    visited.add(currentUrl)
+
+    let fetched: Fetched
+    try {
+      fetched = await fetchPage(currentUrl)
+    } catch (err) {
+      if (page === 1) throw err
+      break // a later page failed — keep what we already have
+    }
+    if (page === 1) finalUrl = fetched.finalUrl
+
+    const res = extractFromPage(fetched, mode, opts)
+    if (page === 1) {
+      pageTitle = res.title
+      pageDescription = res.description
+      note = res.note
+    }
+    pagesFetched++
+
+    for (const it of res.items) {
+      const { position: _position, ...rest } = it
+      void _position
+      const key = JSON.stringify(rest)
+      if (seenKeys.has(key)) continue
+      seenKeys.add(key)
+      items.push(it)
+      if (items.length >= MAX_ITEMS) break
+    }
+    if (items.length >= MAX_ITEMS || page === maxPages || !res.$) break
+
+    const next = findNextUrl(res.$, fetched.finalUrl)
+    if (!next || visited.has(next)) {
+      if (page < maxPages) {
+        note = [note, `Only ${pagesFetched} page${pagesFetched > 1 ? 's' : ''} found (no further "next" link).`]
+          .filter(Boolean)
+          .join(' ')
+      }
+      break
+    }
+    currentUrl = next
+  }
+
+  // keep "position" numbering continuous across pages
+  items.forEach((it, i) => {
+    if ('position' in it) it.position = String(i + 1)
+  })
+
+  let truncated = false
+  let out = items
+  if (out.length > MAX_ITEMS) {
+    out = out.slice(0, MAX_ITEMS)
     truncated = true
   }
 
@@ -577,8 +1213,10 @@ export async function scrapeUrl(
     pageTitle,
     pageDescription,
     mode,
-    items,
+    items: out,
     responseTimeMs: Date.now() - started,
     truncated,
+    pagesFetched,
+    note,
   }
 }
